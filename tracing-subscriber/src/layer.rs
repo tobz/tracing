@@ -1,12 +1,17 @@
 //! A composable abstraction for building `Subscriber`s.
 use tracing_core::{
+    callsite,
     metadata::Metadata,
     span,
     subscriber::{Interest, Subscriber},
     Event,
 };
 
-use std::{any::TypeId, marker::PhantomData};
+use std::{
+    any::TypeId,
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+};
 
 /// A composable handler for `tracing` events.
 ///
@@ -403,6 +408,20 @@ pub struct Layered<L, I, S = I> {
     _s: PhantomData<fn(S)>,
 }
 
+/// A [`Subscriber`] composed of a `Subscriber` wrapped by one or more
+/// [`Layer`]s.
+///
+/// [`Layer`]: ../struct.Layer.html
+/// [`Subscriber`]: https://docs.rs/tracing-core/latest/tracing_core/trait.Subscriber.html
+#[derive(Clone, Debug)]
+pub struct WithFilter<F, I, S = I> {
+    filter: F,
+    inner: I,
+    enabled_spans: RwLock<HashSet<span::Id>>,
+    callsites: RwLock<HashMap<callsite::Identifier, bool>>,
+    _s: PhantomData<fn(S)>,
+}
+
 // === impl Layered ===
 
 impl<L, S> Subscriber for Layered<L, S>
@@ -412,31 +431,20 @@ where
 {
     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
         let outer = self.layer.register_callsite(metadata);
-        if outer.is_never() {
-            // if the outer layer has disabled the callsite, return now so that
-            // the subscriber doesn't get its hopes up.
-            return outer;
-        }
-
         let inner = self.inner.register_callsite(metadata);
-        if outer.is_sometimes() {
-            // if this interest is "sometimes", return "sometimes" to ensure that
-            // filters are reevaluated.
+        if inner.is_never() {
+            outer
+        } else if outer.is_never() {
+            inner
+        } else if inner.is_sometimes() {
             outer
         } else {
-            // otherwise, allow the inner subscriber to weigh in.
             inner
         }
     }
 
     fn enabled(&self, metadata: &Metadata) -> bool {
-        if self.layer.enabled(metadata, self.ctx()) {
-            // if the outer layer enables the callsite metadata, ask the subscriber.
-            self.inner.enabled(metadata)
-        } else {
-            // otherwise, the callsite is disabled by the layer
-            false
-        }
+        self.layer.enabled(metadata, self.ctx()) || self.inner.enabled(metadata)
     }
 
     fn new_span(&self, span: &span::Attributes) -> span::Id {
@@ -509,31 +517,20 @@ where
 {
     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
         let outer = self.layer.register_callsite(metadata);
-        if outer.is_never() {
-            // if the outer layer has disabled the callsite, return now so that
-            // inner layers  don't get their hopes up.
-            return outer;
-        }
-
         let inner = self.inner.register_callsite(metadata);
-        if outer.is_sometimes() {
-            // if this interest is "sometimes", return "sometimes" to ensure that
-            // filters are reevaluated.
+        if inner.is_never() {
+            outer
+        } else if outer.is_never() {
+            inner
+        } else if inner.is_sometimes() {
             outer
         } else {
-            // otherwise, allow the inner layer to weigh in.
             inner
         }
     }
 
     fn enabled(&self, metadata: &Metadata, ctx: Context<S>) -> bool {
-        if self.layer.enabled(metadata, ctx.clone()) {
-            // if the outer layer enables the callsite metadata, ask the inner layer.
-            self.inner.enabled(metadata, ctx)
-        } else {
-            // otherwise, the callsite is disabled by this layer
-            false
-        }
+        self.layer.enabled(metadata, ctx.clone()) || self.inner.enabled(metadata, ctx)
     }
 
     #[inline]
@@ -600,6 +597,137 @@ where
         Context {
             subscriber: Some(&self.inner),
         }
+    }
+}
+
+impl<F, L, S> WithFilter<F, L, S> {
+    #[inline]
+    fn cache_interest(&self, metadata: &Metadata, interest: &Interest) {
+        if interest.is_always() {
+            self.callsites
+                .write()
+                .unwrap()
+                .insert(metadata.callsite(), true);
+        } else if interest.is_never() {
+            self.callsites
+                .write()
+                .unwrap()
+                .insert(metadata.callsite(), false);
+        }
+    }
+
+    #[inline]
+    fn interest_for(&self, metadata: &Metadata) -> Option<bool> {
+        self.callsites.read().unwrap().get(metadata.callsite())
+    }
+
+    #[inline]
+    fn has_enabled(&self, id: &span::Id) -> bool {
+        self.enabled_spans.contains(id)
+    }
+}
+
+impl<F, L, S> Layer<S> for WithFilter<F, L, S>
+where
+    F: Layer<S>,
+    L: Layer<S>,
+    S: Subscriber,
+{
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        let filter = self.filter.register_callsite(metadata);
+        let interest = if filter.is_never() {
+            filter
+        } else {
+            let layer = self.inner.register_callsite(metadata);
+            if layer.is_always() {
+                filter
+            } else {
+                layer
+            }
+        };
+        self.cache_interest(metadata, &interest);
+        interest
+    }
+
+    fn enabled(&self, metadata: &Metadata, ctx: Context<S>) -> bool {
+        self.interest_for(metadata).unwrap_or_else(|| {
+            self.filter.enabled(metadata, ctx.clone()) && self.inner.enabled(metadata, ctx)
+        })
+    }
+
+    #[inline]
+    fn new_span(&self, attrs: &span::Attributes, id: &span::Id, ctx: Context<S>) {
+        self.filter.new_span(attrs, id, ctx.clone());
+        if self.enabled(attrs.metadata(), ctx.clone()) {
+            self.enabled_spans.write().unwrap().insert(id.clone());
+            self.inner.new_span(attrs, id, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_record(&self, span: &span::Id, values: &span::Record, ctx: Context<S>) {
+        if self.has_enabled(span) {
+            self.inner.on_record(span, values, ctx.clone());
+            self.filter.on_record(span, values, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<S>) {
+        if self.has_enabled(span) {
+            self.inner.on_follows_from(span, follows, ctx.clone());
+            self.filter.on_follows_from(span, follows, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_event(&self, event: &Event, ctx: Context<S>) {
+        if self.enabled(event.metadata(), ctx.clone()) {
+            self.inner.on_event(event, ctx.clone());
+            self.filter.on_event(event, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_enter(&self, id: &span::Id, ctx: Context<S>) {
+        if self.has_enabled(id) {
+            self.inner.on_enter(id, ctx.clone());
+            self.filter.on_enter(id, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_exit(&self, id: &span::Id, ctx: Context<S>) {
+        if self.has_enabled(id) {
+            self.inner.on_exit(id, ctx.clone());
+            self.filter.on_exit(id, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_close(&self, id: span::Id, ctx: Context<S>) {
+        if self.has_enabled(&id) {
+            self.enabled_spans.remove(&id);
+            self.inner.on_close(id.clone(), ctx.clone());
+            self.filter.on_close(id, ctx);
+        }
+    }
+
+    #[inline]
+    fn on_id_change(&self, old: &span::Id, new: &span::Id, ctx: Context<S>) {
+        if self.has_enabled(old) {
+            self.enabled_spans.remove(old);
+            self.enabled_spans.insert(new.clone());
+            self.inner.on_id_change(old, new, ctx.clone());
+            self.filter.on_id_change(old, new, ctx);
+        }
+    }
+
+    #[doc(hidden)]
+    unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
+        self.filter
+            .downcast_raw(id)
+            .or_else(|| self.inner.downcast_raw(id))
     }
 }
 
